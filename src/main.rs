@@ -108,25 +108,25 @@ fn prefetch<T>(p: *const T) {
 /// Open-addressing table user-hash -> person key, for linked IDs only.
 struct LinkTab {
     mask: usize,
-    slots: Vec<[u64; 2]>,
+    slots: Vec<[u64; 2]>, // (user hash, person key); key 0 = empty
+    refs: Vec<u64>,       // ref of each slot's own ID
 }
 
 impl LinkTab {
-    fn new(n: usize) -> Self {
-        let cap = (n * 2).next_power_of_two().max(16);
-        LinkTab { mask: cap - 1, slots: vec![[0, 0]; cap] }
-    }
     #[inline]
     fn slot(&self, h: u64) -> usize {
         (h as usize) & self.mask
     }
-    fn insert(&mut self, h: u64, v: u64) {
-        let mut i = self.slot(h);
+    /// Name ref of a linked person (its key is the hash of its smallest ID).
+    fn name(&self, pk: u64) -> Option<u64> {
+        let mut i = self.slot(pk);
         loop {
-            let k = self.slots[i][0];
-            if k == 0 || k == h {
-                self.slots[i] = [h, v];
-                return;
+            let s = &self.slots[i];
+            if s[0] == pk {
+                return Some(self.refs[i]);
+            }
+            if s[0] == 0 {
+                return None;
             }
             i = (i + 1) & self.mask;
         }
@@ -488,7 +488,6 @@ struct Ctx {
     camp_ids: Vec<Vec<u8>>,
     camp_ch: Vec<Vec<u8>>,
     links: LinkTab,
-    names: IdMap<u64, u64>, // linked person key -> name ref
 }
 
 fn list_csv(dir: &Path) -> Vec<PathBuf> {
@@ -648,7 +647,7 @@ fn main() {
     });
 
     // ---- links
-    let (links, names) = build_links(ln_base, ln_paths.len(), nt);
+    let links = build_links(ln_base, ln_paths.len(), nt);
     let t_links = t0.elapsed();
 
     let ctx = Arc::new(Ctx {
@@ -664,7 +663,6 @@ fn main() {
         camp_ids,
         camp_ch,
         links,
-        names,
     });
 
     // ---- parse events + clicks
@@ -945,97 +943,157 @@ fn avg_line(base: usize, n: usize, default: usize) -> f64 {
 
 // ------------------------------------------------------------------ links
 
-fn build_links(base: usize, n: usize, nt: usize) -> (LinkTab, IdMap<u64, u64>) {
+fn build_links(base: usize, n: usize, nt: usize) -> LinkTab {
+    use std::sync::atomic::{AtomicU32, AtomicU64};
     let mut work = Vec::new();
     for i in 0..n {
         chunks_of(base + i, &mut work);
     }
-    let parts: Vec<Vec<(u64, u64, u64, u64)>> = {
+    let bytes: usize = (0..n).map(|i| fdata(base + i).len()).sum();
+    let est_lines = (bytes as f64 / avg_line(base, n, 22) * 1.1) as usize + 16;
+    let cap = (est_lines * 3).next_power_of_two().max(1024);
+    let mask = cap - 1;
+    fn z64(n: usize) -> Vec<AtomicU64> {
+        let mut v = std::mem::ManuallyDrop::new(vec![0u64; n]);
+        unsafe { Vec::from_raw_parts(v.as_mut_ptr() as *mut AtomicU64, v.len(), v.capacity()) }
+    }
+    fn z32(n: usize) -> Vec<AtomicU32> {
+        let mut v = std::mem::ManuallyDrop::new(vec![0u32; n]);
+        unsafe { Vec::from_raw_parts(v.as_mut_ptr() as *mut AtomicU32, v.len(), v.capacity()) }
+    }
+    let keys = z64(cap);
+    let refs = z64(cap);
+    // parent stores parent + 1; 0 means "is a root"
+    let parent = z32(cap);
+    let insert = |h: u64, r: u64| -> u32 {
+        let mut i = (h as usize) & mask;
+        loop {
+            let k = keys[i].load(AO::Relaxed);
+            if k == h {
+                return i as u32;
+            }
+            if k == 0 {
+                match keys[i].compare_exchange(0, h, AO::AcqRel, AO::Acquire) {
+                    Ok(_) => {
+                        refs[i].store(r, AO::Relaxed);
+                        return i as u32;
+                    }
+                    Err(cur) => {
+                        if cur == h {
+                            return i as u32;
+                        }
+                    }
+                }
+            }
+            i = (i + 1) & mask;
+        }
+    };
+    let find = |mut x: u32| -> u32 {
+        loop {
+            let p1 = parent[x as usize].load(AO::Relaxed);
+            if p1 == 0 {
+                return x;
+            }
+            let p = p1 - 1;
+            let gp1 = parent[p as usize].load(AO::Relaxed);
+            if gp1 == 0 {
+                return p;
+            }
+            let _ = parent[x as usize].compare_exchange(p1, gp1, AO::Relaxed, AO::Relaxed);
+            x = gp1 - 1;
+        }
+    };
+    let union = |a: u32, b: u32| {
+        let (mut a, mut b) = (a, b);
+        loop {
+            a = find(a);
+            b = find(b);
+            if a == b {
+                return;
+            }
+            if a < b {
+                std::mem::swap(&mut a, &mut b);
+            }
+            // attach the larger root under the smaller one
+            if parent[a as usize].compare_exchange(0, b + 1, AO::AcqRel, AO::Relaxed).is_ok() {
+                return;
+            }
+        }
+    };
+    {
         let q = Queue::new();
         let work = &work;
-        par_map(nt, |_| {
-            let mut v = Vec::new();
+        run_threads(nt, |_| loop {
+            let i = q.next();
+            if i >= work.len() {
+                break;
+            }
+            let (file, s, e) = work[i];
+            let d = fdata(file);
+            scan::<2>(d, s, e, |_, f| {
+                let (a0, a1) = f[0];
+                let (b0, b1) = f[1];
+                if a0 == a1 || b0 == b1 {
+                    return;
+                }
+                let sa = insert(uhash(&d[a0..a1]), mkref(file, a0, a1 - a0));
+                let sb = insert(uhash(&d[b0..b1]), mkref(file, b0, b1 - b0));
+                if sa != sb {
+                    union(sa, sb);
+                }
+            });
+        });
+    }
+    // name of each root: byte-wise smallest ID (refs written before the key became visible
+    // to other threads may still be 0 only transiently; all inserts are done now)
+    let best = z32(cap); // best slot + 1; 0 = none yet
+    let per = cap.div_ceil(nt);
+    run_threads(nt, |t| {
+        for i in t * per..((t + 1) * per).min(cap) {
+            if keys[i].load(AO::Relaxed) == 0 {
+                continue;
+            }
+            let r = find(i as u32) as usize;
+            let mine = rbytes(refs[i].load(AO::Relaxed));
+            let mut cur = best[r].load(AO::Relaxed);
             loop {
-                let i = q.next();
-                if i >= work.len() {
+                if cur != 0 && rbytes(refs[cur as usize - 1].load(AO::Relaxed)) <= mine {
                     break;
                 }
-                let (file, s, e) = work[i];
-                let d = fdata(file);
-                scan::<2>(d, s, e, |_, f| {
-                    let (a0, a1) = f[0];
-                    let (b0, b1) = f[1];
-                    if a0 == a1 || b0 == b1 {
-                        return;
-                    }
-                    v.push((uhash(&d[a0..a1]), uhash(&d[b0..b1]), mkref(file, a0, a1 - a0), mkref(file, b0, b1 - b0)));
-                });
-            }
-            v
-        })
-    };
-    let total: usize = parts.iter().map(|v| v.len()).sum();
-    let mut idx: IdMap<u64, u32> = IdMap::with_capacity_and_hasher(total, Default::default());
-    let mut ids: Vec<(u64, u64)> = Vec::with_capacity(total);
-    let mut parent: Vec<u32> = Vec::with_capacity(total);
-    fn find(p: &mut [u32], mut x: u32) -> u32 {
-        let mut r = x;
-        while p[r as usize] != r {
-            r = p[r as usize];
-        }
-        while p[x as usize] != r {
-            let nx = p[x as usize];
-            p[x as usize] = r;
-            x = nx;
-        }
-        r
-    }
-    for v in &parts {
-        for &(ha, hb, ra, rb) in v {
-            let mut get = |h: u64, r: u64| -> u32 {
-                *idx.entry(h).or_insert_with(|| {
-                    let i = ids.len() as u32;
-                    ids.push((h, r));
-                    parent.push(i);
-                    i
-                })
-            };
-            let a = get(ha, ra);
-            let b = get(hb, rb);
-            let x = find(&mut parent, a);
-            let y = find(&mut parent, b);
-            if x != y {
-                if x < y {
-                    parent[y as usize] = x;
-                } else {
-                    parent[x as usize] = y;
+                match best[r].compare_exchange(cur, i as u32 + 1, AO::AcqRel, AO::Relaxed) {
+                    Ok(_) => break,
+                    Err(c) => cur = c,
                 }
             }
         }
+    });
+    let mut slots: Vec<[u64; 2]> = Vec::with_capacity(cap);
+    let mut nrefs: Vec<u64> = Vec::with_capacity(cap);
+    unsafe {
+        slots.set_len(cap);
+        nrefs.set_len(cap);
     }
-    let m = ids.len();
-    let mut best: Vec<u32> = (0..m as u32).collect();
-    for i in 0..m as u32 {
-        let r = find(&mut parent, i) as usize;
-        let b = best[r];
-        if b != i && rbytes(ids[i as usize].1) < rbytes(ids[b as usize].1) {
-            best[r] = i;
-        }
+    {
+        let sp = slots.as_mut_ptr() as usize;
+        let np = nrefs.as_mut_ptr() as usize;
+        run_threads(nt, |t| {
+            for i in t * per..((t + 1) * per).min(cap) {
+                let k = keys[i].load(AO::Relaxed);
+                let (pk, nr) = if k == 0 {
+                    (0, 0)
+                } else {
+                    let r = find(i as u32) as usize;
+                    let b = best[r].load(AO::Relaxed) as usize - 1;
+                    (keys[b].load(AO::Relaxed), refs[i].load(AO::Relaxed))
+                };
+                unsafe {
+                    (sp as *mut [u64; 2]).add(i).write([k, pk]);
+                    (np as *mut u64).add(i).write(nr);
+                }
+            }
+        });
     }
-    let mut tab = LinkTab::new(m);
-    let mut names: IdMap<u64, u64> = IdMap::default();
-    for i in 0..m {
-        let r = find(&mut parent, i as u32) as usize;
-        let b = best[r] as usize;
-        let pk = ids[b].0;
-        if pk != ids[i].0 {
-            tab.insert(ids[i].0, pk);
-        }
-        if r == i {
-            names.insert(pk, ids[b].1);
-        }
-    }
-    (tab, names)
+    LinkTab { mask, slots, refs: nrefs }
 }
 
 // ------------------------------------------------------------------ parsing
@@ -1386,8 +1444,8 @@ fn write_outputs(ctx: &Ctx, out: &Path, user_rows: Vec<Vec<URow>>, camp: &[[u64;
         }
         let rows = &ur[i];
         let name = |r: &URow| -> &'static [u8] {
-            match ctx.names.get(&r.person) {
-                Some(&nr) => rbytes(nr),
+            match ctx.links.name(r.person) {
+                Some(nr) => rbytes(nr),
                 None => rbytes(r.uref),
             }
         };
