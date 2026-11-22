@@ -510,10 +510,11 @@ fn map_file(p: &Path) -> Option<Mmap> {
     if len == 0 {
         return None;
     }
-    #[cfg(unix)]
-    let m = unsafe { memmap2::MmapOptions::new().populate().map(&f).expect("mmap") };
-    #[cfg(not(unix))]
-    let m = unsafe { Mmap::map(&f).expect("mmap") };
+    let m = if std::env::var("POPULATE").is_ok() {
+        unsafe { memmap2::MmapOptions::new().populate().map(&f).expect("mmap") }
+    } else {
+        unsafe { Mmap::map(&f).expect("mmap") }
+    };
     Some(m)
 }
 
