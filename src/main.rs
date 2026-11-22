@@ -189,7 +189,8 @@ fn scan<const N: usize>(d: &'static [u8], s: usize, e: usize, mut f: impl FnMut(
     let mut nf = 0usize;
     let mut line_start = s;
     let mut fstart = s;
-    let mut quote = false;
+    let mut fq = 0u32; // quote characters seen in the current field
+    let mut bad = false;
     let mut pos = s;
     let mut buf = [0u8; 64];
     while pos < e {
@@ -207,57 +208,57 @@ fn scan<const N: usize>(d: &'static [u8], s: usize, e: usize, mut f: impl FnMut(
             let b = seps.trailing_zeros();
             let p = pos + b as usize;
             let bit = 1u64 << b;
-            if mnl & bit != 0 {
-                let upto = bit | (bit - 1);
-                if q & (bit - 1) != 0 {
-                    quote = true;
+            let below = bit - 1;
+            fq += (q & below).count_ones();
+            q &= !(below | bit);
+            let mut st = fstart;
+            let mut en = p;
+            if fq != 0 {
+                if fq == 2 && en - st >= 2 && unsafe { *d.get_unchecked(st) == b'"' && *d.get_unchecked(en - 1) == b'"' } {
+                    st += 1;
+                    en -= 1;
+                } else {
+                    bad = true;
                 }
-                q &= !upto;
-                if nf == N - 1 {
-                    fields[N - 1] = (fstart, p);
-                    finish(d, line_start, quote, &mut fields, &mut f);
+                fq = 0;
+            }
+            if nf < N {
+                fields[nf] = (st, en);
+            }
+            nf += 1;
+            fstart = p + 1;
+            if mnl & bit != 0 {
+                if nf == N && !bad {
+                    f(line_start, &fields);
                 }
                 nf = 0;
+                bad = false;
                 line_start = p + 1;
-                fstart = p + 1;
-                quote = false;
-            } else {
-                if nf < N - 1 {
-                    fields[nf] = (fstart, p);
-                }
-                nf += 1;
-                fstart = p + 1;
             }
             seps &= seps - 1;
         }
-        if q != 0 {
-            quote = true;
-        }
+        fq += q.count_ones();
         pos += 64;
     }
-    if line_start < e && nf == N - 1 {
-        fields[N - 1] = (fstart, e);
-        finish(d, line_start, quote, &mut fields, &mut f);
-    }
-}
-
-#[inline(always)]
-fn finish<const N: usize>(d: &'static [u8], line_start: usize, quote: bool, fields: &mut [(usize, usize); N], f: &mut impl FnMut(usize, &[(usize, usize); N])) {
-    if quote {
-        for fr in fields.iter_mut() {
-            let v = &d[fr.0..fr.1];
-            if v.len() >= 2 && v[0] == b'"' && v[v.len() - 1] == b'"' {
-                if memchr(b'"', &v[1..v.len() - 1]).is_some() {
-                    return;
-                }
-                fr.0 += 1;
-                fr.1 -= 1;
-            } else if memchr(b'"', v).is_some() {
-                return;
+    if line_start < e {
+        let mut st = fstart;
+        let mut en = e;
+        if fq != 0 {
+            if fq == 2 && en - st >= 2 && d[st] == b'"' && d[en - 1] == b'"' {
+                st += 1;
+                en -= 1;
+            } else {
+                bad = true;
             }
         }
+        if nf < N {
+            fields[nf] = (st, en);
+        }
+        nf += 1;
+        if nf == N && !bad {
+            f(line_start, &fields);
+        }
     }
-    f(line_start, fields);
 }
 
 /// Byte ranges [start, end) of each chunk of a file's data lines.
@@ -283,17 +284,6 @@ fn chunks_of(file: usize, out: &mut Vec<(usize, usize, usize)>) {
 
 // ------------------------------------------------------------------ time
 
-#[inline]
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
-
 #[inline(always)]
 fn dig2(a: u8, b: u8) -> Option<i64> {
     let x = a.wrapping_sub(b'0');
@@ -313,8 +303,20 @@ fn parse_ts(s: &[u8]) -> Option<i64> {
     if n == 0 {
         return None;
     }
-    if (n == 20 || n == 25) && s[4] == b'-' {
-        return parse_iso(s);
+    if n == 20 || n == 25 {
+        if s[4] == b'-' {
+            return parse_iso(s);
+        }
+    }
+    if n <= 16 {
+        let mut buf = [b'0'; 16];
+        buf[16 - n..].copy_from_slice(s);
+        let a = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let b = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        if !all_digits8(a) || !all_digits8(b) {
+            return None;
+        }
+        return Some((parse8(a) * 100_000_000 + parse8(b)) as i64);
     }
     let mut v: i64 = 0;
     let mut sig = 0usize;
@@ -334,35 +336,71 @@ fn parse_ts(s: &[u8]) -> Option<i64> {
     Some(v)
 }
 
+#[inline(always)]
+fn all_digits8(v: u64) -> bool {
+    let x = v ^ 0x3030_3030_3030_3030; // digits -> 0..9
+    let y = (x & 0x7F7F_7F7F_7F7F_7F7F) + 0x7676_7676_7676_7676; // high bit set iff low7 >= 10
+    (x | y) & 0x8080_8080_8080_8080 == 0
+}
+
+/// 8 ASCII digits (little-endian load, most significant first) -> value.
+#[inline(always)]
+fn parse8(v: u64) -> u64 {
+    let v = v - 0x3030_3030_3030_3030;
+    let v = (v * 10) + (v >> 8);
+    let v = ((v & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000 << 32))
+        + ((v >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000 << 32)))
+        >> 32;
+    v
+}
+
+const CUM_DAYS: [i64; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+
 #[inline]
 fn parse_iso(s: &[u8]) -> Option<i64> {
-    if s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+    // "YYYY-MM-DDTHH:MM:SS" then "Z" or "+HH:MM"
+    let a = u64::from_le_bytes(s[0..8].try_into().unwrap()); // YYYY-MM-
+    let b = u64::from_le_bytes(s[8..16].try_into().unwrap()); // DDTHH:MM
+    let c = u32::from_le_bytes(s[15..19].try_into().unwrap()); // M:SS
+    // separators
+    const SEP_A_MASK: u64 = 0xFF00_00FF_0000_0000;
+    const SEP_A: u64 = 0x2D00_002D_0000_0000; // '-' at 4 and 7
+    if a & SEP_A_MASK != SEP_A || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
         return None;
     }
-    let y = dig2(s[0], s[1])? * 100 + dig2(s[2], s[3])?;
-    let mo = dig2(s[5], s[6])?;
-    let d = dig2(s[8], s[9])?;
-    let h = dig2(s[11], s[12])?;
-    let mi = dig2(s[14], s[15])?;
-    let se = dig2(s[17], s[18])?;
+    // digits: replace separators with '0' and check all
+    let a_d = (a & !SEP_A_MASK) | (0x3000_0030_0000_0000);
+    let b_d = (b & !0x0000_FF00_00FF_0000u64) | 0x0000_3000_0030_0000; // 'T' at 2, ':' at 5
+    let c_d = (c & !0x0000_00FFu32 & !0x0000_FF00u32) | 0x0000_3030; // keep SS (bytes 2,3)
+    let cc = ((c_d as u64) << 32) | 0x3030_3030;
+    if !all_digits8(a_d) || !all_digits8(b_d) || !all_digits8(cc) {
+        return None;
+    }
+    let ab = a.to_le_bytes();
+    let bb = b.to_le_bytes();
+    let dv = |x: u8| (x - b'0') as i64;
+    let y = dv(ab[0]) * 1000 + dv(ab[1]) * 100 + dv(ab[2]) * 10 + dv(ab[3]);
+    let mo = dv(ab[5]) * 10 + dv(ab[6]);
+    let d = dv(bb[0]) * 10 + dv(bb[1]);
+    let h = dv(bb[3]) * 10 + dv(bb[4]);
+    let mi = dv(bb[6]) * 10 + dv(bb[7]);
+    let se = dv(s[17]) * 10 + dv(s[18]);
     if !(1..=12).contains(&mo) || d < 1 || h > 23 || mi > 59 || se > 59 {
         return None;
     }
+    let leap = is_leap(y);
     let dim = match mo {
-        2 => {
-            if is_leap(y) {
-                29
-            } else {
-                28
-            }
-        }
+        2 => 28 + leap as i64,
         4 | 6 | 9 | 11 => 30,
         _ => 31,
     };
     if d > dim {
         return None;
     }
-    let mut t = ((days_from_civil(y, mo, d) * 24 + h) * 60 + mi) * 60 + se;
+    let yy = y - 1;
+    let days_before_year = 365 * (y - 1970) + (yy / 4 - yy / 100 + yy / 400) - 477; // 477 = leaps before 1970
+    let days = days_before_year + CUM_DAYS[mo as usize] + (leap && mo > 2) as i64 + d - 1;
+    let mut t = ((days * 24 + h) * 60 + mi) * 60 + se;
     if s.len() == 20 {
         if s[19] != b'Z' {
             return None;
@@ -443,10 +481,10 @@ struct Ctx {
     ws_day: i64,
     ndays: usize,
     ing_base: i64, // seconds
-    products: hashbrown::HashMap<&'static [u8], u8>,
+    products: IdMap<u64, u8>,
     unknown_cat: u8,
     cats: Vec<Vec<u8>>,
-    campaigns: hashbrown::HashMap<&'static [u8], u32>,
+    campaigns: IdMap<u64, u32>,
     camp_ids: Vec<Vec<u8>>,
     camp_ch: Vec<Vec<u8>>,
     links: LinkTab,
@@ -591,18 +629,18 @@ fn main() {
     cats.dedup();
     assert!(cats.len() < 256, "too many categories");
     let unknown_cat = cats.binary_search(&b"unknown".to_vec()).unwrap() as u8;
-    let mut products = hashbrown::HashMap::with_capacity(prod_raw.len());
+    let mut products: IdMap<u64, u8> = IdMap::with_capacity_and_hasher(prod_raw.len(), Default::default());
     for (p, c) in &prod_raw {
-        products.insert(*p, cats.binary_search(&c.to_vec()).unwrap() as u8);
+        products.entry(uhash(p)).or_insert(cats.binary_search(&c.to_vec()).unwrap() as u8);
     }
 
     // ---- campaigns
-    let mut campaigns = hashbrown::HashMap::new();
+    let mut campaigns: IdMap<u64, u32> = IdMap::default();
     let mut camp_ids = Vec::new();
     let mut camp_ch = Vec::new();
     small_csv(1, |id, ch| {
-        if !campaigns.contains_key(id) {
-            campaigns.insert(id, camp_ids.len() as u32);
+        if !campaigns.contains_key(&uhash(id)) {
+            campaigns.insert(uhash(id), camp_ids.len() as u32);
             camp_ids.push(id.to_vec());
             camp_ch.push(ch.to_vec());
         }
@@ -746,27 +784,20 @@ fn main() {
             let mut st = PersonState::new(ctx.cats.len(), nc);
             let mut evs: Vec<Ev> = Vec::new();
             let mut cls: Vec<Click> = Vec::new();
+            let mut counts: Vec<u32> = Vec::new();
             loop {
                 let p = q.next();
                 if p >= P2 {
                     break;
                 }
-                evs.clear();
-                for d in deduped.iter() {
-                    evs.extend_from_slice(&d[p]);
-                }
+                let esrc: Vec<&[Ev]> = deduped.iter().map(|d| &d[p][..]).collect();
+                bucket_sort(&esrc, &mut evs, &mut counts, |e| e.person, |a, b| (a.person, a.ts) < (b.person, b.ts));
                 if evs.is_empty() {
                     continue;
                 }
-                cls.clear();
-                for (_, cb) in parsed.iter() {
-                    cls.extend_from_slice(&cb[p]);
-                }
-                evs.sort_unstable_by_key(|e| ((e.person as u128) << 32) | e.ts as u128);
-                cls.sort_unstable_by(|a, b| {
-                    (a.person, a.ts)
-                        .cmp(&(b.person, b.ts))
-                        .then_with(|| rbytes(a.cref).cmp(rbytes(b.cref)))
+                let csrc: Vec<&[Click]> = parsed.iter().map(|(_, cb)| &cb[p][..]).collect();
+                bucket_sort(&csrc, &mut cls, &mut counts, |c| c.person, |a, b| {
+                    (a.person, a.ts).cmp(&(b.person, b.ts)).then_with(|| rbytes(a.cref).cmp(rbytes(b.cref))) == std::cmp::Ordering::Less
                 });
                 let mut ci = 0usize;
                 let mut i = 0usize;
@@ -820,6 +851,75 @@ fn main() {
     std::mem::forget(deduped);
     // skip destructors of large structures
     std::process::exit(0);
+}
+
+/// Gather `src` into `out` sorted by `less`, using a counting pass on the
+/// person-hash bits just below the partition bits, then small sorts.
+fn bucket_sort<T: Copy>(src: &[&[T]], out: &mut Vec<T>, counts: &mut Vec<u32>, key: impl Fn(&T) -> u64, less: impl Fn(&T, &T) -> bool + Copy) {
+    let total: usize = src.iter().map(|s| s.len()).sum();
+    out.clear();
+    if total == 0 {
+        return;
+    }
+    let bb = ((total / 4).max(2).ilog2()).clamp(1, 18);
+    let shift = 64 - P2_BITS - bb;
+    let mask = (1u64 << bb) - 1;
+    let nb = 1usize << bb;
+    counts.clear();
+    counts.resize(nb + 1, 0);
+    for s in src {
+        for x in s.iter() {
+            counts[((key(x) >> shift) & mask) as usize + 1] += 1;
+        }
+    }
+    for i in 0..nb {
+        counts[i + 1] += counts[i];
+    }
+    out.reserve(total);
+    unsafe {
+        out.set_len(total);
+    }
+    {
+        let o = out.as_mut_ptr();
+        for s in src {
+            for x in s.iter() {
+                let b = ((key(x) >> shift) & mask) as usize;
+                let c = unsafe { counts.get_unchecked_mut(b) };
+                unsafe { o.add(*c as usize).write(*x) };
+                *c += 1;
+            }
+        }
+    }
+    // counts[b] is now the end of bucket b; bucket b starts at counts[b-1] (0 for b = 0)
+    let mut start = 0usize;
+    for b in 0..nb {
+        let end = counts[b] as usize;
+        let sl = &mut out[start..end];
+        if sl.len() > 1 {
+            if sl.len() <= 20 {
+                for i in 1..sl.len() {
+                    let x = sl[i];
+                    let mut j = i;
+                    while j > 0 && less(&x, &sl[j - 1]) {
+                        sl[j] = sl[j - 1];
+                        j -= 1;
+                    }
+                    sl[j] = x;
+                }
+            } else {
+                sl.sort_unstable_by(|a, b| {
+                    if less(a, b) {
+                        std::cmp::Ordering::Less
+                    } else if less(b, a) {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                });
+            }
+        }
+        start = end;
+    }
 }
 
 /// Average line length over a sample of the largest file in a group.
@@ -1022,7 +1122,7 @@ fn parse_events(ctx: &Ctx, file: usize, s: usize, e: usize, eb: &mut [Vec<ERaw>]
             r.uref = mkref(file, f[1].0, user.len());
             r.ts = (ts - ctx.ws) as u32;
             r.price = price;
-            r.cat = *ctx.products.get(prod).unwrap_or(&ctx.unknown_cat);
+            r.cat = *ctx.products.get(&uhash(prod)).unwrap_or(&ctx.unknown_cat);
             r.flags = 1 | if purchase { 2 } else { 0 };
             // pipeline: resolve the record pushed RING lines ago
             let k = rn % RING;
@@ -1071,7 +1171,7 @@ fn parse_clicks(ctx: &Ctx, file: usize, s: usize, e: usize, cb: &mut [Vec<Click>
             Some(t) if t >= lo && t < ctx.we => t,
             _ => return,
         };
-        let camp = match ctx.campaigns.get(g(2)) {
+        let camp = match ctx.campaigns.get(&uhash(g(2))) {
             Some(&c) => c,
             None => return,
         };
