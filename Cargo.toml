@@ -12,6 +12,7 @@ memmap2 = "0.9.12"
 parquet = { version = "60.2.0", default-features = false, features = ["arrow"] }
 mimalloc = { version = "0.1", default-features = false }
 xxhash-rust = { version = "0.8.21", features = ["xxh3"] }
+libc = "0.2.191"
 
 [profile.release]
 opt-level = 3

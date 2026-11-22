@@ -40,14 +40,85 @@ const CHUNK: usize = 2 << 20;
 
 // ------------------------------------------------------------------ files
 
-static FILES: OnceLock<Vec<Option<Mmap>>> = OnceLock::new();
+static FILES: OnceLock<Vec<&'static [u8]>> = OnceLock::new();
 
 #[inline]
 fn fdata(i: usize) -> &'static [u8] {
-    match &FILES.get().unwrap()[i] {
-        Some(m) => &m[..],
-        None => &[],
+    unsafe { FILES.get().unwrap_unchecked().get_unchecked(i) }
+}
+
+/// Anonymous memory for file contents; on Linux backed by transparent huge pages.
+fn alloc_region(n: usize) -> *mut u8 {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let p = libc::mmap(
+            std::ptr::null_mut(),
+            n.max(1),
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        );
+        assert!(p != libc::MAP_FAILED, "mmap region");
+        libc::madvise(p, n.max(1), libc::MADV_HUGEPAGE);
+        p as *mut u8
     }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut v = std::mem::ManuallyDrop::new(vec![0u8; n.max(1)]);
+        v.as_mut_ptr()
+    }
+}
+
+#[inline]
+fn read_at(f: &File, buf: &mut [u8], mut off: u64) {
+    let mut done = 0;
+    while done < buf.len() {
+        #[cfg(unix)]
+        let r = std::os::unix::fs::FileExt::read_at(f, &mut buf[done..], off);
+        #[cfg(windows)]
+        let r = std::os::windows::fs::FileExt::seek_read(f, &mut buf[done..], off);
+        let k = r.expect("read");
+        if k == 0 {
+            break;
+        }
+        done += k;
+        off += k as u64;
+    }
+}
+
+/// Read every file into one region with parallel positioned reads.
+fn load_files(paths: &[PathBuf], nt: usize) -> Vec<&'static [u8]> {
+    let files: Vec<File> = paths.iter().map(|p| File::open(p).expect("open")).collect();
+    let sizes: Vec<usize> = files.iter().map(|f| f.metadata().map(|m| m.len() as usize).unwrap_or(0)).collect();
+    let mut offs = Vec::with_capacity(paths.len());
+    let mut total = 0usize;
+    for &sz in &sizes {
+        offs.push(total);
+        total += (sz + 63) & !63;
+    }
+    let base = alloc_region(total) as usize;
+    const PIECE: usize = 4 << 20;
+    let mut pieces = Vec::new();
+    for (i, &sz) in sizes.iter().enumerate() {
+        let mut o = 0;
+        while o < sz {
+            let l = PIECE.min(sz - o);
+            pieces.push((i, o, l));
+            o += l;
+        }
+    }
+    let q = Queue::new();
+    run_threads(nt, |_| loop {
+        let k = q.next();
+        if k >= pieces.len() {
+            break;
+        }
+        let (i, o, l) = pieces[k];
+        let buf = unsafe { std::slice::from_raw_parts_mut((base + offs[i] + o) as *mut u8, l) };
+        read_at(&files[i], buf, o as u64);
+    });
+    (0..paths.len()).map(|i| unsafe { std::slice::from_raw_parts((base + offs[i]) as *const u8, sizes[i]) }).collect()
 }
 
 const OFF_BITS: u32 = 38;
@@ -598,7 +669,7 @@ fn main() {
     paths.extend(ln_paths.iter().cloned());
     let n_files = paths.len();
     assert!(n_files < (1 << (64 - OFF_BITS - LEN_BITS)), "too many files");
-    let maps: Vec<Option<Mmap>> = {
+    let maps: Vec<&'static [u8]> = if std::env::var("USE_MMAP").is_ok() {
         let slots: Slots<Option<Mmap>> = Slots::new(n_files);
         let q = Queue::new();
         run_threads(nt.min(n_files), |_| loop {
@@ -608,7 +679,19 @@ fn main() {
             }
             slots.put(i, map_file(&paths[i]));
         });
-        slots.take()
+        slots
+            .take()
+            .into_iter()
+            .map(|m| match m {
+                Some(m) => {
+                    let m: &'static Mmap = Box::leak(Box::new(m));
+                    &m[..]
+                }
+                None => &[][..],
+            })
+            .collect()
+    } else {
+        load_files(&paths, nt)
     };
     let _ = FILES.set(maps);
     let t_map = t0.elapsed();
